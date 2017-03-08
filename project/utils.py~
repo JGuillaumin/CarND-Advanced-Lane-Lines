@@ -1,0 +1,479 @@
+import numpy as np
+import os
+import cv2
+from scipy import signal
+
+from project.settings import settings
+
+
+def pipeline(file, output_dir, save_inter, mtx, dist, filepath=False):
+    """
+    Main function, it applies all steps and save intermediate outputs.
+
+    :param file: path to an image or already loaded image as numpy array
+    :param output_dir: path to a folder where images will be saved
+    :param save_inter: (boolean) if True, it will save intermediate outputs
+    :param mtx: camera matrix
+    :param dist: distortion coefficients
+    :param filepath: boolean that indicates if `file` is a filepath or an array.
+    :return: combined image : image + lane boundaries + numerical estimation of curvature and vehicule position
+    """
+
+    # this block loads parameters from settings.py
+    # ################### SETTINGS #######################
+    xgrad_thr = settings["xgrad_thr"]
+    s_thr = settings["s_thr"]
+    l_thr = settings["l_thr"]
+
+    ROI_ptA = settings["ROI_ptA"]
+    ROI_ptB = settings["ROI_ptB"]
+
+    corners = settings["corners"]
+    offset = settings["offset"]
+    ######################################################
+
+    if filepath == True:
+        # Read in image
+        img = cv2.imread(file)
+        image_name = os.path.split(file)[-1]
+    else:
+        img = file
+        image_name = 'video'
+
+    # STEP 1 : undistort image with camera matrix and distortion coefficients
+    undist = cv2.undistort(img, mtx, dist, None, mtx)
+    if save_inter:
+        # save undistorted image
+        cv2.imwrite(os.path.join(output_dir, 'undist_' + image_name), undist)
+
+    # STEP 2 : make binary image with color/gradient thresholds
+    binary_image = make_binary(undist, xgrad_thr=xgrad_thr, s_thr=s_thr, l_thr=l_thr)
+    if save_inter:
+        # save binary images
+        cv2.imwrite(os.path.join(output_dir, 'binary_' + image_name), binary_image)
+
+    # STEP 3 : extract ROI region
+    masked_binary_image = ROI_extraction(binary_image, ROI_ptA, ROI_ptB)
+    if save_inter:
+        # save ROI of the binary image
+        cv2.imwrite(os.path.join(output_dir, 'masked_binary_' + image_name), masked_binary_image)
+
+    # STEP 4 : get binary lines from 'birds eye view'
+    binary_lines, dst, src = get_lines(masked_binary_image, corners=corners, offset=offset)
+    if save_inter:
+        # save lines from 'birds eye view'
+        cv2.imwrite(os.path.join(output_dir, 'binary_lines_' + image_name), binary_lines)
+
+    # STEP 5 : fit and draw lines (+ free zone between lines)
+    # send only the first channel (all channels are identical)
+    img_lines, left_coeffs, right_coeffs = fit_draw_lines(undist, binary_lines[:,:,0], dst=dst, src=src)
+    if save_inter:
+        # save image with lane boundaries (without information about curvature and vehicule position)
+        cv2.imwrite(os.path.join(output_dir, 'lines_' + image_name), img_lines)
+
+    # STEP 6 : compute curvature and display informations
+    # for images, combined will be saved after, in `launch_image_pipeline.py`
+    combined = compute_display_curvature(img_lines, left_coeffs, right_coeffs)
+
+    return combined
+
+
+def make_binary(undist, xgrad_thr=(40,130), s_thr=(120, 255), l_thr=(45, 255)):
+    """
+    Create a binary image that highlights lane lines
+
+    :param undist: undistorted image
+    :param xgrad_thr: (min,max) thresholds applied on Sobel operator w.r.t. X axis
+    :param s_thr: (min,max) thresholds applied on channel S from HLS colorspace
+    :param l_thr: (min,max) thresholds applied on channel L from HLS colorspace
+    :return:
+    """
+
+    # convert to HLS color space
+    hls = cv2.cvtColor(undist, cv2.COLOR_RGB2HLS).astype(np.float)
+
+    # h_channel = hls[:,:,0]
+    l_channel = hls[:, :, 1]
+    s_channel = hls[:, :, 2]
+
+    sobelx = cv2.Sobel(l_channel, cv2.CV_64F, 1, 0)
+    abs_sobelx = np.absolute(sobelx)
+    scaled_sobel = np.uint8(255 * abs_sobelx / np.max(abs_sobelx))
+
+    sxbinary = np.zeros_like(scaled_sobel)
+    sxbinary[(scaled_sobel >= xgrad_thr[0]) & (scaled_sobel <= xgrad_thr[1])] = 1
+
+    s_binary = np.zeros_like(s_channel)
+    s_binary[(s_channel >= s_thr[0]) & (s_channel <= s_thr[1])] = 1
+
+    # Apply threshold on L channel
+    l_binary = np.zeros_like(l_channel)
+    l_binary[(l_cha nnel >= l_thr[0]) & (l_channel <= l_thr[1])] = 1
+
+    # Stack all binary images
+    binary = np.zeros_like(sxbinary)
+    binary[((l_binary == 1) & (s_binary == 1) | (sxbinary == 1))] = 1
+    binary = 255 * np.dstack((binary, binary, binary)).astype('uint8')
+
+    return binary
+
+
+def ROI_extraction(binary_image, ptA=(560, 450), ptB=(720, 450)):
+    """
+    Apply a mask on ROI region, to select relevant pixels.
+    To tune : top points (left and right) that define the region.
+    Bottom points are image corners.
+
+    This function works well with BGR (or RGB) images and binary images.
+
+    :param binary_image: thresholded binary image
+    :param ptA: tuple of integers (pixel_h, pixel_w) that define the left top points
+    :param ptB: tuple of integers (pixel_h, pixel_w) that define the right top points
+    :return: masked image
+    """
+
+    imshape = binary_image.shape
+    vertices = np.array([[(0, imshape[0]), ptA, ptB, (imshape[1], imshape[0])]], dtype=np.int32)
+    mask = np.zeros_like(binary_image)
+
+    # defining a 3 channel or 1 channel color to fill the mask with depending on the input image
+    if len(imshape) > 2:
+        channel_count = imshape[2]  # i.e. 3 or 4 depending on your image
+        ignore_mask_color = (255,) * channel_count
+    else:
+        ignore_mask_color = 255
+
+    # filling pixels inside the polygon defined by "vertices" with the fill color
+    cv2.fillPoly(mask, vertices, ignore_mask_color)
+
+    # returning the image only where mask pixels are nonzero
+    masked_image = cv2.bitwise_and(binary_image, mask)
+    return masked_image
+
+
+def get_lines(masked_binary_image, corners, offset):
+    """
+    Apply a perspective transformation to get the lines from a birds eye view.
+
+    :param masked_binary_image: binary lines from dashboard view
+    :param corners: list of 4 points that define the 'src' for cv2.getPerspectiveTransform
+    :param offset: modification applied to corners to define 'dst' for cv2.getPerspectiveTransform
+    :return: the warpd image, dst and src (to compute later the inverse perspective transform)
+    """
+    img_shape = masked_binary_image.shape
+
+    new_top_left = np.array([corners[0, 0], 0])
+    new_top_right = np.array([corners[3, 0], 0])
+
+    src = np.float32([corners[0], corners[1], corners[2], corners[3]])
+    dst = np.float32([corners[0] + offset, new_top_left + offset, new_top_right - offset, corners[3] - offset])
+
+    M = cv2.getPerspectiveTransform(src, dst)
+    warped = cv2.warpPerspective(masked_binary_image, M, (img_shape[1], img_shape[0]), flags=cv2.INTER_CUBIC)
+    return warped, dst, src
+
+
+def fit_draw_lines(undist_img, binary_lines, dst, src, v_offset=50, h_offset=50, nb_steps=6, window_radius=200):
+    """
+
+    This functions draw and fit the left and the right lines.
+    It returns the `combined_img` (normal view with colored free space zone) and the coefficients that fit the lines.
+
+
+    :param undist_img: undistorted image
+    :param binary_lines: binary lines from birds eye view (only 1 channel) shape must be (H,W)
+    :param dst: destination points used before in cv2.getPerspectiveTransform
+    :param src: source points used before in cv2.getPerspectiveTransform
+    :param v_offset: number of pixel to remove at the top and bottom of the `binary_lines`(it creates an offset)
+    :param h_offset: number of pixel to remove at the right and left of the `binary_lines`(it creates an offset)
+    :param nb_steps: number of splits of `binary_lines` into multiple windows
+    :param window_radius: size of the box where points
+    :return: combined_img, left_coeffs, right_coeffs
+    """
+
+    # Initialise arrays : list of points that correspond to the right and left lines
+    left_x = []
+    left_y = []
+    right_x = []
+    right_y = []
+
+    # Parameters
+    height = binary_lines.shape[0]
+    offset_height = height - v_offset
+    width = binary_lines.shape[1]
+    half_frame = binary_lines.shape[1] // 2
+    pixels_per_step = offset_height // nb_steps
+
+    for step in range(nb_steps):
+        left_x_window_centres = []
+        right_x_window_centres = []
+        y_window_centres = []
+
+        # Define the window (horizontal slice)
+        window_start_y = step * pixels_per_step
+        window_end_y = window_start_y + pixels_per_step
+
+        # Take a count of all the pixel at each x-value in the horizontal slice
+        histogram = np.sum(binary_lines[int(window_start_y):int(window_end_y),int(h_offset):int(width - h_offset)],
+                           axis=0)
+
+        # Identify the left and right peaks
+        left_peaks = np.array(signal.find_peaks_cwt(histogram[:half_frame], np.arange(1, 10)))  # shape (2,)
+        right_peaks = np.array(signal.find_peaks_cwt(histogram[half_frame:], np.arange(1, 10)))  # shape (2,)
+
+        if len(left_peaks) > 0:
+            left_peak = max(left_peaks)
+            left_x_window_centres.append(left_peak)
+
+        if len(right_peaks) > 0:
+            right_peak = max(right_peaks) + half_frame
+            right_x_window_centres.append(right_peak)
+
+        # Add coordinates to window centres
+        if len(left_peaks) > 0 or len(right_peaks) > 0:
+            y_window_centres.append((window_start_y + window_end_y) // 2)
+
+        # Get pixels in the left window
+        for left_x_centre, y_centre in zip(left_x_window_centres, y_window_centres):
+            left_x_additional, left_y_additional = get_pixel_in_window(binary_lines, left_x_centre,
+                                                                       y_centre, window_radius)
+
+            left_x.append(left_x_additional)
+            left_y.append(left_y_additional)
+
+        # Get pixels in the right window
+        for right_x_centre, y_centre in zip(right_x_window_centres, y_window_centres):
+            right_x_additional, right_y_additional = get_pixel_in_window(binary_lines, right_x_centre,
+                                                                         y_centre, window_radius)
+
+            right_x.append(right_x_additional)
+            right_y.append(right_y_additional)
+
+    if len(right_x) == 0 or len(left_x) == 0:
+        print("Init no peaks for left or right")
+        print("left_x: ", left_x)
+        print("right_x: ", right_x)
+
+        # launch the same procedure without horizontal_offset
+        horizontal_offset = 0
+
+        left_x = []
+        left_y = []
+        right_x = []
+        right_y = []
+
+        for step in range(nb_steps):
+            left_x_window_centres = []
+            right_x_window_centres = []
+            y_window_centres = []
+
+            # Define the window (horizontal slice)
+            window_start_y = height - (step * pixels_per_step) + v_offset
+            window_end_y = window_start_y - pixels_per_step + v_offset
+
+            # Take a count of all the pixels at each x-value in the horizontal slice
+            histogram = np.sum(binary_lines[int(window_end_y):int(window_start_y), int(horizontal_offset):int(width - horizontal_offset)],
+                               axis=0)
+
+            # Identify the left and right peaks
+            left_peaks = np.array(signal.find_peaks_cwt(histogram[:half_frame], np.arange(1, 10)))
+            right_peaks = np.array(signal.find_peaks_cwt(histogram[half_frame:], np.arange(1, 10)))
+
+            if len(left_peaks) > 0:
+                left_peak = max(left_peaks)
+                left_x_window_centres.append(left_peak)
+
+            if len(right_peaks) > 0:
+                right_peak = max(right_peaks) + half_frame
+                right_x_window_centres.append(right_peak)
+
+            # Add coordinates to window centres
+
+            if len(left_peaks) > 0 or len(right_peaks) > 0:
+                y_window_centres.append((window_start_y + window_end_y) // 2)
+
+            # Get pixels in the left window
+            for left_x_centre, y_centre in zip(left_x_window_centres, y_window_centres):
+                left_x_additional, left_y_additional = get_pixel_in_window(binary_lines, left_x_centre,
+                                                                           y_centre, window_radius)
+                # Add pixels to list
+                left_x.append(left_x_additional)
+                left_y.append(left_y_additional)
+
+            # Get pixels in the right window
+            for right_x_centre, y_centre in zip(right_x_window_centres, y_window_centres):
+                right_x_additional, right_y_additional = get_pixel_in_window(binary_lines, right_x_centre,
+                                                                             y_centre, window_radius)
+                # Add pixels to list
+                right_x.append(right_x_additional)
+                right_y.append(right_y_additional)
+
+    leftx, lefty, rightx, righty = collapse_into_single_arrays(left_x, left_y, right_x, right_y)
+
+    # fit polynomial
+    left_fit, left_coeffs = fit_second_order_poly(lefty, leftx)
+    right_fit, right_coeffs = fit_second_order_poly(righty, rightx)
+
+    # draw polynomials
+    blank_canvas = np.zeros(binary_lines.shape)
+    colour_canvas = cv2.cvtColor(blank_canvas.astype(np.uint8), cv2.COLOR_GRAY2RGB)
+
+    polyfit_left = draw_poly(blank_canvas, lane_poly, left_coeffs, 30)
+    polyfit_drawn = draw_poly(polyfit_left, lane_poly, right_coeffs, 30)
+
+    trace = colour_canvas
+    trace[polyfit_drawn > 1] = [0, 0, 255]
+    area = highlight_lane_line_area(blank_canvas, left_coeffs, right_coeffs)
+    trace[area == 1] = [0, 255, 0]
+
+    imshape = undist_img.shape
+
+    Minv = cv2.getPerspectiveTransform(dst, src)
+
+    # Warp lane boundaries back onto original image
+    lane_lines = cv2.warpPerspective(trace, Minv, (imshape[1], imshape[0]), flags=cv2.INTER_LINEAR)
+
+    # Convert to colour
+    combined_img = cv2.add(lane_lines, undist_img)
+
+    return combined_img, left_coeffs, right_coeffs
+
+
+def get_pixel_in_window(img, x_center, y_center, size):
+    """
+    Returns (x,y), list of points where value==1 in `binary_lines` in a suare region of size `size` centered on
+    (x_center, y_center)
+
+    :param img: binary lines (only 1 channel)
+    :param x_center: x position of the center
+    :param y_center: y position of the center
+    :param size: size of the window
+    :return: (x,y) list of points
+    """
+    half_size = size // 2
+    window = img[int(y_center - half_size):int(y_center + half_size), int(x_center - half_size):int(x_center + half_size)]
+
+    x, y = (window.T == 1).nonzero()
+
+    x = x + x_center - half_size
+    y = y + y_center - half_size
+
+    return x, y
+
+
+def collapse_into_single_arrays(leftx, lefty, rightx, righty):
+    """
+    Each argument is a list of arrays.
+    It rewrite this list as a single numpy array.
+
+    :param leftx: list of arrays
+    :param lefty: list of arrays
+    :param rightx: list of arrays
+    :param righty: list of arrays
+    :return: leftx, lefty, rightx, righty as 4 single numpy arrays
+    """
+
+    leftx = [x
+             for array in leftx
+             for x in array]
+    lefty = [x
+             for array in lefty
+             for x in array]
+    rightx = [x
+              for array in rightx
+              for x in array]
+    righty = [x
+              for array in righty
+              for x in array]
+
+    leftx = np.array(leftx)
+    lefty = np.array(lefty)
+    rightx = np.array(rightx)
+    righty = np.array(righty)
+
+    return leftx, lefty, rightx, righty
+
+
+def fit_second_order_poly(Y, X):
+    """
+    Fit a polynomial (2nd order) with np.polyfit
+
+    :param Y: y points
+    :param X: x points
+    :return: the fitted oints and the coefficients
+    """
+    fit = np.polyfit(Y, X, 2)
+    fitdep = fit[0]*Y**2 + fit[1]*Y + fit[2]
+
+    return fitdep, fit
+
+
+def draw_poly(img, poly, poly_coeffs, steps, color=[255, 0, 0], thickness=10, dashed=False):
+
+    img_height = img.shape[0]
+    pixels_per_step = img_height // steps
+
+    for i in range(steps):
+        start = i * pixels_per_step
+        end = start + pixels_per_step
+
+        start_point = (int(poly(start, poly_coeffs=poly_coeffs)), start)
+        end_point = (int(poly(end, poly_coeffs=poly_coeffs)), end)
+
+        if dashed == False or i % 2 == 1:
+            img = cv2.line(img, end_point, start_point, color, thickness)
+
+    return img
+
+
+def lane_poly(yval, poly_coeffs):
+    """Returns x value for poly given a y-value.
+    Note here x = Ay^2 + By + C."""
+    return poly_coeffs[0]*yval**2 + poly_coeffs[1]*yval + poly_coeffs[2]
+
+
+def highlight_lane_line_area(mask_template, left_poly, right_poly, start_y=0, end_y =720):
+    area_mask = mask_template
+    for y in range(start_y, end_y):
+        left = lane_poly(y, left_poly)
+        right = lane_poly(y, right_poly)
+        area_mask[y][int(left):int(right)] = 1
+
+    return area_mask
+
+
+def compute_display_curvature(img_lines, left_coeffs, right_coeffs):
+    y_eval = 500
+    left_curverad = np.absolute(((1 + (2 * left_coeffs[0] * y_eval + left_coeffs[1]) ** 2) ** 1.5) \
+                                / (2 * left_coeffs[0]))
+    right_curverad = np.absolute(((1 + (2 * right_coeffs[0] * y_eval + right_coeffs[1]) ** 2) ** 1.5) \
+                                 / (2 * right_coeffs[0]))
+    # print("Left lane curve radius: ", left_curverad, "pixels")
+    # print("Right lane curve radius: ", right_curverad, "pixels")
+    curvature = (left_curverad + right_curverad) / 2
+    pos = center(719, left_coeffs, right_coeffs)
+    min_curvature = min(left_curverad, right_curverad)
+
+    vehicle_position = pos / 12800 * 3.7
+    curvature = curvature / 128 * 3.7
+    min_curvature = min_curvature / 128 * 3.7
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    cv2.putText(img_lines, 'Radius of Curvature = %d(m)' % curvature, (50, 50), font, 1, (255, 255, 255), 2)
+    left_or_right = "left" if vehicle_position < 0 else "right"
+    cv2.putText(img_lines, 'Vehicle is %.2fm %s of center' % (np.abs(vehicle_position), left_or_right), (50, 100), font, 1,
+                (255, 255, 255), 2)
+    cv2.putText(img_lines, 'Min Radius of Curvature = %d(m)' % min_curvature, (50, 150), font, 1, (255, 255, 255), 2)
+    cv2.putText(img_lines, 'Left poly coefficients = %.3f %.3f %.3f' % (left_coeffs[0], left_coeffs[1], left_coeffs[2]),
+                (50, 200), font, 1, (255, 255, 255), 2)
+    cv2.putText(img_lines, 'Right poly coefficients = %.3f %.3f %.3f' % (right_coeffs[0], right_coeffs[1], right_coeffs[2]),
+                (50, 250), font, 1, (255, 255, 255), 2)
+
+    return img_lines
+
+
+def center(y, left_poly, right_poly):
+    center = (1.5 * lane_poly(y, left_poly)
+              - lane_poly(y, right_poly)) / 2
+    return center
+
