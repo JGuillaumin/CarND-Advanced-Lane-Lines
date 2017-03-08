@@ -1,21 +1,10 @@
 ## Advanced Lane Finding
-[![Udacity - Self-Driving Car NanoDegree](https://s3.amazonaws.com/udacity-sdc/github/shield-carnd.svg)](http://www.udacity.com/drive)
 
 
-In this project, your goal is to write a software pipeline to identify the lane boundaries in a video, but the main output or product we want you to create is a detailed writeup of the project.  Check out the [writeup template](https://github.com/udacity/CarND-Advanced-Lane-Lines/blob/master/writeup_template.md) for this project and use it as a starting point for creating your own writeup.  
+The goal of this project was to write a software pipeline to identify the lane boundaries in a video.
 
-Creating a great writeup:
----
-A great writeup should include the rubric points as well as your description of how you addressed each point.  You should include a detailed description of the code used in each step (with line-number references and code snippets where necessary), and links to other supporting documents or external references.  You should include images in your writeup to demonstrate how your code works with examples.  
 
-All that said, please be concise!  We're not looking for you to write a book here, just a brief description of how you passed each rubric point, and references to the relevant code :). 
-
-You're not required to use markdown for your writeup.  If you use another method please just submit a pdf of your writeup.
-
-The Project
----
-
-The goals / steps of this project are the following:
+The steps of this project are the following:
 
 * Compute the camera calibration matrix and distortion coefficients given a set of chessboard images.
 * Apply a distortion correction to raw images.
@@ -26,10 +15,70 @@ The goals / steps of this project are the following:
 * Warp the detected lane boundaries back onto the original image.
 * Output visual display of the lane boundaries and numerical estimation of lane curvature and vehicle position.
 
-The images for camera calibration are stored in the folder called `camera_cal`.  The images in `test_images` are for testing your pipeline on single frames.  If you want to extract more test images from the videos, you can simply use an image writing method like `cv2.imwrite()`, i.e., you can read the video in frame by frame as usual, and for frames you want to save for later you can write to an image file.  
 
-To help the reviewer examine your work, please save examples of the output from each stage of your pipeline in the folder called `ouput_images`, and include a description in your writeup for the project of what each image shows.    The video called `project_video.mp4` is the video your pipeline should work well on.  
+## Project structure
 
-The `challenge_video.mp4` video is an extra (and optional) challenge for you if you want to test your pipeline under somewhat trickier conditions.  The `harder_challenge.mp4` video is another optional challenge and is brutal!
+- `camera_cal/` : images for camera calibration provided by Udacity
+- `tes_images/` : images (from Udacity) for testing the pipeline and select hyper-parameters
+- `examples/` : screenshots from Udacity
+- `output_images/` : folder where intermediate outputs will be stored (when executing `project/launch_image_pipeline.py`)
+- `project/` : my work, see `project/README.md` for more information
+- `challenge_video.mp4` and `harder_video_challenge.mp4` : videos for applying the pipeline
+- `NOTEBOOK_SelectParameters.ipynb` : Jupyter notebook that helps to select the right parameters
+- `NOTEBOOK_AdvancedLaneLines.ipynb` : it's my first draft for this project, it might contain some debug lines.
 
-If you're feeling ambitious (again, totally optional though), don't stop there!  We encourage you to go out and take video of your own, calibrate your camera and show us how you would implement this project from scratch!
+
+## Launch the pipeline on images or videos 
+
+(see `project/README.md` for more information)
+
+**PYTHONPATH** :
+When you are at the root of the project, add this path to `PYTHONPATH` !
+
+```bash
+export PYTHONPATH=$PYTHONPATH:$PWD
+```
+
+
+There are two three main scripts in `project`:
+
+
+#### Compute camera calibration matrix
+
+```python
+python project/launch_camera_calibration.py \
+                --input_dir camera_cal
+                \--nx 9 --ny 6 \
+                --save_images
+                \--output_dir tmp
+```
+
+
+#### Apply pipeline to images within a folder
+
+```python
+python project/launch_image_pipeline.py \
+                --input_dir test_images/ \
+                --camera_calib_file camera_cal/camera_calibration.pkl \
+                --output_dir output_images \
+                --save_inter
+```
+
+
+#### Apply pipeline to a video
+
+```python
+python project/launch_video_pipeline.py \
+                --input_video project_video.mp4 \
+                --output_video output_project_video.mp4 \
+                --camera_calib_file camera_cal/camera_calibration.pkl
+```
+
+
+
+#### Notebook `NOTEBOOK_SelectParameters.ipynb`
+
+I wrote a notebook that takes all steps from the pipeline separately.
+It's useful for parameter selection.
+
+In addition to the code comments, it explains all steps.
